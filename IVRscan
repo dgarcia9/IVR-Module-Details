@@ -1,0 +1,162 @@
+import json
+import xmltodict
+import os
+
+import requests
+import zeep
+from zeep.plugins import HistoryPlugin
+import pandas as pd
+
+
+settings = {
+    'FIVENINE_CONFIG_WEBSERVICES_API': 'https://api.Five9.com/wsadmin/v12/?wsdl&user={five9username}',
+
+    'FIVENINE_ADMIN_SUPERUSER': {
+        'username': 'Five9Username',
+        'password': 'Five9Password'
+    },
+}
+
+five9username = settings['FIVENINE_ADMIN_SUPERUSER']['username']
+five9password = settings['FIVENINE_ADMIN_SUPERUSER']['password']
+
+history = HistoryPlugin()
+
+session = requests.Session()
+session.auth = requests.auth.HTTPBasicAuth(five9username, five9password)
+
+client = zeep.Client(
+    settings['FIVENINE_CONFIG_WEBSERVICES_API'].format(five9username=five9username),
+    transport=zeep.Transport(session=session),
+    plugins=[history, ]
+)
+
+
+""" Enter modules comma separated that you want to generate a report for."""
+""" Module examples are: 'incomingCall', 'query', 'hangup', 'setVariable', 'ifElse', 'play', 'lookupCRMRecord', 
+'crmUpdate', 'getDigits', 'systemInfo', 'skillTransfer', 'menu', 'thirdPartyTransfer', 'foreignScript', 'setDNC', 
+'case', 'voiceMailTransfer', 'input', 'language', 'iterator', 'agentTransfer', 'recording', 'answerMachine', 
+'systemUpdate'"""
+
+MODULES = ["agentTransfer", "thirdPartyTransfer"]
+
+# Set and create output directory if needed
+DIRECTORY = os.path.dirname(os.path.realpath(__file__))
+os.makedirs(f"{DIRECTORY}\\IVR_Data", exist_ok=True)
+temp_directory = f"{DIRECTORY}\\IVR_Data"
+
+
+# Get all IVR scripts from domain
+def get_ivr_scripts():
+    print("Getting IVR Scripts")
+    ivr_scripts = client.service.getIVRScripts()
+    for ivr in ivr_scripts:
+        with open(f"{temp_directory}\\{ivr['name']}.xml", "w") as file:
+            file.write(ivr['xmlDefinition'])
+    read_files()
+
+
+# Load the xml files
+def read_files():
+    directory = temp_directory
+    entries = os.listdir(directory)
+
+    files = []
+    for entry in entries:
+        if entry.endswith(".xml") and "EXAMPLES..Five9" not in entry:
+            full_path = os.path.join(directory, entry)
+            if os.path.isfile(full_path):
+                files.append(entry)
+
+    scan_ivr(files)
+
+
+# Loop through IVR files for the module
+def scan_ivr(files):
+    for module_name in MODULES:
+        print(f"Looping through IVRs for module: {module_name}")
+        data_list = []
+        for file in files:
+            ivr_name = file.strip(".xml")
+            with open(f"{temp_directory}\\{file}") as xml_file:
+                data_dict = xmltodict.parse(xml_file.read())
+
+            json_data = json.dumps(data_dict)
+
+            with open(f"{temp_directory}\\data.json", "w") as json_file:
+                json_file.write(json_data)
+
+            with open(f"{temp_directory}\\data.json") as file:
+                data = json.load(file)
+
+            for module in data["ivrScript"]["modules"]:
+                if module == module_name:
+                    if isinstance(data["ivrScript"]["modules"][module], list):
+                        for item in data["ivrScript"]["modules"][module]:
+                            flattened_data = flatten_json(item)
+                            flattened_data['IVR Name'] = ivr_name
+                            data_list.append(flattened_data)
+                    else:
+                        flattened_data = flatten_json(data["ivrScript"]["modules"][module])
+                        flattened_data['IVR Name'] = ivr_name
+                        data_list.append(flattened_data)
+        add_data(data_list, module_name)
+    cleanup()
+
+
+# Flattens JSON string to get all data points nested
+def flatten_json(nested_json):
+    out = {}
+
+    def flatten(x, name=''):
+        if type(x) is dict:
+            for a in x:
+                flatten(x[a], name + a + '.')
+        elif type(x) is list:
+            i = 0
+            for a in x:
+                flatten(a, name + str(i) + '.')
+                i += 1
+        else:
+            out[name[:-1]] = x
+
+    flatten(nested_json)
+    return out
+
+
+# Add data to pandas dataframe for export to CSV
+def add_data(data_list, module_name):
+    print("Outputting data to file")
+    if len(data_list) > 0:
+        df = pd.DataFrame(data_list)
+        columns_to_drop = [col for col in df.columns if "ascendants" in col]
+        df = df.drop(columns=columns_to_drop)
+        columns_to_drop = [col for col in df.columns if "singleDescendant" in col]
+        df = df.drop(columns=columns_to_drop)
+        columns_to_drop = [col for col in df.columns if "locationX" in col]
+        df = df.drop(columns=columns_to_drop)
+        columns_to_drop = [col for col in df.columns if "locationY" in col]
+        df = df.drop(columns=columns_to_drop)
+        column_to_move = "IVR Name"
+        new_column_order = [column_to_move] + [col for col in df.columns if col != column_to_move]
+        df = df[new_column_order]
+        df.to_csv(f"{temp_directory}\\{module_name}.csv", index=False)
+
+
+# Cleans folder of temp xml and json files
+def cleanup():
+    print("Cleaning up temp files")
+    try:
+        for filename in os.listdir(temp_directory):
+            if filename.endswith(".xml"):
+                file_path = os.path.join(temp_directory)
+                os.remove(f"{file_path}\\{filename}")
+        os.remove(f"{temp_directory}\\data.json")
+    except FileNotFoundError:
+        print(f"Error: Directory not found at {temp_directory}")
+    except Exception as e:
+        print(f"An error occurred while cleaning up: {e}")
+
+
+if __name__ == '__main__':
+    get_ivr_scripts()
